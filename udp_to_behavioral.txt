@@ -1,0 +1,213 @@
+Verilog User Defined Primitives (UDP) to behavioral code conversion.
+
+Synthesized designs are using foundry-provided gate models,
+which contain both functional description and timing checks.
+Verilator ignores the timing check given in specify blocks,
+so the timing checks are not an issue.
+However, most foundry-provided gate models are using UDPs,
+which cannot be simulated by Verilator.
+One solution is to manually write the behavioral module equivalent to primitive UDP.
+It is not enough just to replace the primitive UDPs with behavioral modules.
+Primitive instances name is optional, while module instances must have an instance name. 
+Therefore, it is necessary to go through the foundry-provided library
+and insert instance names for replaced primitives.
+
+This is an attempt to convert the UDPs automatically.
+
+There are two types of Verilog UDPs:
+    - combinatorial,
+    - sequential.
+    
+The task of converting combinatorial UDPs to behavioral code is trivial,
+since the combinatorial table can be converted to casez statement directly.
+
+For example, 
+
+primitive multiplexer(mux,control,dataA,dataB ) ;
+    output mux ;
+    input control, dataA, dataB ;
+    table
+        // control dataA dataB mux
+              0      1     ? : 1 ;
+              0      0     ? : 0 ;
+              1      ?     1 : 1 ;
+              1      ?     0 : 0 ;
+              x      0     0 : 0 ;
+              x      1     1 : 1 ;
+    endtable
+endprimitive
+
+can be directly converted to:
+
+module multiplexer(mux, control, dataA, dataB);
+    output reg mux ;
+    input control, dataA, dataB ;
+
+    always @(*)
+    casez ({control, dataA, dataB})
+        3'b01? : mux = 1'b1;
+        3'b00? : mux = 1'b0;
+        3'b1?1 : mux = 1'b1;
+        3'b1?0 : mux = 1'b0;
+        3'bx00 : mux = 1'b0;
+        3'bx11 : mux = 1'b1;
+    endcase
+endmodule
+
+Sequential UDPs are not straight-forward.
+For example, SR flip-flop UDP can be written as:
+
+primitive srff (q,s,r); 
+    output q; reg q; 
+    input s,r; 
+     
+    table   
+      // s r q q'   
+         1 0:?:1;   
+         f 0:1:-;   
+         0 r:?:0;   
+         0 f:0:-;   
+         1 1:?:0; 
+    endtable 
+endprimitive
+
+The sequential UDP to behavioral Verilog conversion can be simplified
+by observing that UDP specification requires all transitions, 
+even the ones not changing the output state, must be listed.
+Transitions which are not changing the output state can
+be specified either by '-' or by having equal current and next output value.
+
+The SR flip-flop UDP table can be simplified to:
+    table   
+      // s r q q'   
+         1 0:?:1;   
+         0 r:?:0;   
+         1 1:?:0; 
+    endtable 
+
+The UDP table to behavioral Verilog conversion can be performed by
+making an event detector and output assignment for each entry.
+Event detectors can be made with always @(*) for level sensitive entries
+or always @(posedge) or always @(negedge) for rising or falling edge transitions.
+
+The template for level sensitive transitions event detector would be:
+    reg event_n;
+    always @(*)
+    begin
+        if ( inputs == table_entry)
+            event_n = 1;
+        else
+            event_n = 0;
+    end
+where inputs and table_entry do not contain don't care bits, and n in event_n
+is an event number.
+
+The template for edge sensitive transitions event detector would be:
+    reg event_n;
+    always @(posedge edge_input or posedge event_n_clear)    //  or negedge edge_input, depending on table
+    begin
+        if ( event_n_clear)
+            event_n = 0;
+        else if ( inputs == table_entry)
+            event_n = 1;
+    end
+where edge_input is the edge sensitive signal specified in table, and
+inputs and table_entry do not contain don't care bits and edge_input signal.
+
+Output assignment should be performed in a single always @(*) block to avoid
+having multiple drivers for output.
+
+Template output assignment block would be:
+    always @(*)
+    begin
+        if (event_0)
+            output = table_entry_0_output;
+        .
+        .
+        .
+        if (event_x)    // Edge events
+        begin
+            output = table_entry_x_output;
+            event_x_clear = 1;
+        end
+        else
+            event_x_clear = 0;        
+        .
+        .
+        .
+        if (event_n)
+            output = table_entry_n_output
+    end
+
+Edge sensitive transitions are detected and set to 1 in event detector, and
+cleared by an assigment of event_x_clear = 1 in output assignment block.
+The sequence of events is:
+edge event 
+event_n = 1 
+output is set to table defined value, event_n_clear = 1
+event_n = 0
+event_n_clear = 0
+The described sequence of events is performed in simulator delta time.
+    
+The behavioral Verilog code for example SR flip-flop would be:
+
+module srff (q,s,r); 
+    output q; reg q; 
+    input s,r; 
+
+    reg event_0, event_1, event_2;
+    reg event_1_clear = 1'b0;
+
+    always @(*)
+    begin
+        if ( {s,r} == {1'b1,1'b0})
+            event_0 = 1;
+        else
+            event_0 = 0;
+    end
+
+    always @(posedge r or posedge event_1_clear)
+    begin
+        if (event_1_clear)
+            event_1 <= 1'b0;
+        else if ( {s} == {1'b0})
+            event_1 <= 1'b1;
+    end
+
+    always @(*)
+    begin
+        if ( {s,r} == {1'b1,1'b1})
+            event_2 = 1;
+        else
+            event_2 = 0;
+    end
+
+    always @(*)
+    begin
+        if (event_0)
+            q = 1'b1;
+            
+        if (event_1)
+        begin
+            q = 1'b0;
+            event_1_clear = 1;
+        end
+        else
+            event_1_clear = 0;
+            
+        if (event_2)
+            q = 1'b0;
+    end
+    
+endmodule
+
+Based on the previous example, a small Python utility has been written udp2beh.py which converts
+UDP primitives, both combinatorial and sequential, to behavioral Verilog code.
+The tool uses a very very primitive Verilog parsing, and is provided only to demonstrate the idea.
+
+A testcase has been provided in testcase directory.
+Script compile.sh translates the Verilog file test.v containing a sequential UDP
+to test_noprimitives.v which is functionally equivalent, but contains only behavioral Verilog.
+Then it compiles the resulting file and makes an executable sim which simulates the JK flip-flop.
+
+
