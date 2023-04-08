@@ -523,6 +523,7 @@ def getUDPs(sourceVerilog):
         keyword = line.split()[0].strip()
         if keyword=="primitive":
             # Found primitive
+            print("found primitive")
             primitiveText = [line]
             sourceVerilog.pop(pos)
             while pos<len(sourceVerilog):
@@ -530,8 +531,13 @@ def getUDPs(sourceVerilog):
                 sourceVerilog.pop(pos)
                 if line.strip()=="":
                     continue
+                x = line.find("//")
+                y = line.strip().find("endprimitive")
+                if x!=-1 and y != -1 and y<x:
+                    line = line[0:x].strip()
                 primitiveText.append(line)
                 if line.strip()=="endprimitive":
+                    print(line)
                     break
                 
             if pos==len(sourceVerilog) and line.strip()!="endprimitive":
